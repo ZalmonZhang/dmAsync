@@ -1,0 +1,33 @@
+﻿diff --git a/dmAsync/connection.py b/dmAsync/connection.py
+index 6376e78..884c49f 100644
+--- a/dmAsync/connection.py
++++ b/dmAsync/connection.py
+@@ -36,7 +36,7 @@ from .utils import (
+ WSAENOTSOCK = 10038
+ 
+ def connect(host=None, user=None, password=None, port=None, dsn=None, autoCommit=True,
+-            connection_timeout=0, login_timeout=5, loop=None, **kwargs):
++            connection_timeout=0, login_timeout=30, loop=None, **kwargs):
+     connection = Connection(host=host, user=user, password=password, port=port, dsn=dsn, autoCommit=autoCommit,
+                             connection_timeout=connection_timeout, login_timeout=login_timeout, loop=loop, **kwargs)
+ 
+@@ -536,7 +536,7 @@ async def _close_cursor(c: Cursor) -> None:
+ 
+ class Connection:
+     def __init__(self, host=None, user=None, password=None, port=None, dsn=None,
+-                autoCommit=True, connection_timeout=0, login_timeout=5, loop=None, **kwargs):
++                autoCommit=True, connection_timeout=0, login_timeout=30, loop=None, **kwargs):
+ 
+         if loop is None:
+             self._loop = get_running_loop()
+@@ -545,9 +545,6 @@ class Connection:
+         self._waiter: Optional[
+             "asyncio.Future[None]"
+         ] = self._loop.create_future()
+-        self._waiter: Optional[
+-            "asyncio.Future[None]"
+-        ] = self._loop.create_future()
+ 
+         self.init_connect_with_param(host, user, password, port, dsn, autoCommit=autoCommit,
+                                 connection_timeout=connection_timeout, login_timeout=login_timeout, **kwargs)
+

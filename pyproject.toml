@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmAsync"
+version = "1.0.0.post1"
+description = "Asynchronous compatibility package for DM — patched snapshot (upstream: PyPI dmasync 1.0.0)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Dameng" }]
+keywords = ["DM", "async", "dmPython", "dmasync"]
+dependencies = ["dmPython", "async_timeout"]
+
+[tool.setuptools]
+packages = ["dmAsync"]
