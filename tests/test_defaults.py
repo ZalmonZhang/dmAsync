@@ -34,6 +34,18 @@ class DefaultsTest(unittest.TestCase):
             "补丁 2：需要 async_timeout 依赖",
         )
 
+    def test_cursor_echo_false_positional(self):
+        # 补丁 4：Connection._cursor 传给 Cursor 的第 4 个位置参数应为 False（echo），
+        # isolation_level 归位命名参数；否则隔离级别会被丢弃并污染 echo。
+        from dmAsync import connection as conn_mod
+
+        src = inspect.getsource(conn_mod.Connection._cursor)
+        self.assertIn(
+            "Cursor(self, impl, timeout, False, isolation_level)",
+            src,
+            "补丁 4：应显式传 echo=False，避免 isolation_level 落入 echo 槽",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -152,8 +152,8 @@ SQLAlchemy 升级改变 `AsyncAdapt_dbapi_cursor.execute` 的消费方式时会�
 ## 7. 本地源包补丁清单（post 版 wheel）
 
 构建方式：`uvx --from wheel wheel unpack` → 改源码 → `wheel pack`，并清理 `INSTALLER/REQUESTED/direct_url.json` 等安装残留。
-产物（叠加使用，最新 `post4`）：`dmasync-1.0.0.post1-py3-none-any.whl`、
-`dmSQLAlchemy-2.0.17.post1/2/3/4-py3-none-any.whl`。
+产物（叠加使用，最新 **`dmSQLAlchemy post5` + `dmasync post2`**）：`dmasync-1.0.0.post1/2-py3-none-any.whl`、
+`dmSQLAlchemy-2.0.17.post1/2/3/4/5-py3-none-any.whl`。
 
 ### 7.1 `dmAsync` 1.0.0 → 1.0.0.post1
 | 坑 | 文件 | 改动 |
@@ -192,10 +192,29 @@ SQLAlchemy 自动改为**逐行 INSERT + 单行 RETURNING INTO**。
 post4 后 `Core return_defaults()+executemany` 变为诚实的 `[(None,), ...]`，且少拼一次 RETURNING
 （Core executemany 1000 行 0.020s→0.019s）。
 
-### 7.5 未纳入补丁（需评估，暂不改）
-- **M4 服务端游标**：`create_cursor` 覆盖可修，但 `AsyncConnection.stream()` 依赖 `_is_server_side`，需整体验证，未改。
-- **M5 `fetchone/fetchall` 走同步 raw**：属 AsyncAdapt 层设计，改动侵入性大。
-- **低危若干**（`_connect` 的 dict 位置参数、`dsn` 被丢弃、`Cursor(...)` 位置错位）：未动。
+### 7.5 `dmSQLAlchemy` 2.0.17.post4 → 2.0.17.post5（M4：修复服务端游标 / `conn.stream()`）
+| 项 | 文件 | 改动 |
+|---|---|---|
+| M4 | `dmSQLAlchemy/dmasync.py`（`DMExecutionContextAsync_dmasync`） | ① 删除类体末尾覆盖赋值的 `def create_cursor`；② `create_default_cursor` 由 `self._dbapi_connection.raw.cursor()` 改为 `self._dbapi_connection.cursor()`；③ `create_server_side_cursor` 由 `.raw.cursor()` 改为 `self._dbapi_connection.ss_cursor()` |
+
+**根因**：`create_cursor = default.DefaultExecutionContext.create_cursor` 被同名 `def` 覆盖，`_is_server_side` 恒 `False`，
+`stream_results`/`stream()` 全部失效；且两个 `create_*_cursor` 返回裸 dmAsync 游标，与适配层期望的 `AsyncAdapt_*` 游标不一致。
+修后实测见 §8.1。
+
+### 7.6 `dmAsync` 1.0.0.post1 → 1.0.0.post2（低危 #3：`Cursor` 位置参数错位）
+| 项 | 文件 | 改动 |
+|---|---|---|
+| 低危 #3 | `dmAsync/connection.py`（`Connection._cursor`） | `Cursor(self, impl, timeout, isolation_level)` → `Cursor(self, impl, timeout, False, isolation_level)` |
+
+**根因**：`Cursor.__init__(conn, impl, timeout, echo, isolation_level=None)` 的第 4 位是 `echo`，原来把 `isolation_level`
+传了进去 → 隔离级别既不生效、又污染 `echo`。实测修前 `cursor.echo=<IsolationLevel...>`、`_transaction=Default`；
+修后 `echo=False`、`isolation_level=read_committed` 正确进入 `Transaction`。影响面小（SQLAlchemy 走 `set_isolation_level`）。
+
+### 7.7 仍未纳入补丁（需评估）
+- **M5 `fetchone/fetchall` 走同步 raw**（`AsyncAdapt_dmasync_cursor`）：会在事件循环里同步取数（20 万行实测阻塞 ≈0.24s）。
+  主流做法是在 `_execute_async` 里缓冲 `_rows`（实测可降到 ≈0.067s），但需全量缓冲、并适配 `do_execute` 的外层 `await_only` 契约，改动侵入性大；
+  **且 M4 修好后 `conn.stream()` 已能缓解大结果集阻塞（≈0.02s），暂不做**。
+- **低危 #1/#2**（`_connect` 的 dict 位置参数、`dsn` 被丢弃）：实际使用中无害（SQLAlchemy 路径靠 host/port 连接），未动。
 
 ## 8. 与主流方言对照 + 达梦 RETURNING 能力边界
 
@@ -241,3 +260,33 @@ C2/D4 的根因是"**架构选型像 Oracle、驱动能力却缺失**"。把 SQL
 | 单条 insert / text executemany / DML / 类型往返 | ✅ | ✅ |
 
 `verify.py`：**PASS 19/23 → 21/23**，KNOWN **4 → 0**。
+
+### 8.1 服务端游标（M4）实测（2026-09-23，`dmSQLAlchemy 2.0.17.post5`）
+
+| 场景 | post4（现状） | post5（修复后） |
+|---|---|---|
+| `execute(text(...).execution_options(stream_results=True))` | `_is_server_side=False`（静默退化） | SQLAlchemy 正确拒绝：`AsyncMethodRequired`，提示改用 `conn.stream()` |
+| `conn.stream(...)` | ❌ `AssertionError` | ✅ 正常流式 |
+| `conn.stream(...)` **20 万行** | — | ✅ `n=200000`，事件循环最大阻塞 **0.0162s** |
+| 普通 `SELECT` / ORM `add_all` | ✅ | ✅ 无回归 |
+
+对照：非流式路径的 20 万行同步 fetch 会阻塞事件循环 ≈0.24s（见 §7.7 M5）。
+回归：`verify.py` **PASS 21/23，KNOWN 0**（与 post4 一致）；`optionA_compare.py` **TOTAL=21 FAIL=1**（仅 S10 设计内）；
+`verify.py --stress 30` **30/30**。
+说明：`create_cursor = default.DefaultExecutionContext.create_cursor` 决定了 `_is_server_side` 的赋值，
+一旦被同名 `def` 覆盖，`supports_server_side_cursors=True` 也形同虚设。
+
+### 8.2 `VARCHAR` 绑定语义（坑 8）实测（DM8，实例 `LENGTH_IN_CHAR=0` / BYTE / READ ONLY）
+
+| 列定义 | 字面量 6 汉字（18B） | **绑定** 6 汉字（18B） |
+|---|---|---|
+| `VARCHAR(10)` | ❌ `-6169 列[s]长度超出定义` | ❌ `-70005 字符串截断` |
+| `VARCHAR(10 CHAR)` | ✅ | ❌ `-6108 字符串截断` |
+| `VARCHAR2(10 CHAR)` | ✅ | ❌ `-6108 字符串截断` |
+| `VARCHAR(18 CHAR)` | ✅ | ✅ |
+
+边界扫描（绑定 6 汉字=18B）：`VARCHAR(3/6/9/10 CHAR)` 全失败，`VARCHAR(18 CHAR)` 成功 →
+**绑定上限 = 列声明的 `n`，按字节算**，与 `CHAR` 无关；**裸 dmPython 完全一致**（非 SQLAlchemy 层问题）。
+且方言本身已把 `String(10)` 渲染为 `VARCHAR2(10 CHAR)`（`_supports_char_length=True`），列 `char_length=10`，
+所以"列语义"这一侧其实已按字符；**真正的坑在绑定侧**。
+因此**无法在 wheel 内修复**，只能：按字节预留列长（CJK ×3）、或建库时 `LENGTH_IN_CHAR=1`（当前实例只读，不可在线改）。

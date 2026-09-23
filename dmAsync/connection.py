@@ -684,7 +684,7 @@ class Connection:
             scrollable=scrollable,
             withhold=withhold,
         )
-        cursor = Cursor(self, impl, timeout, isolation_level)
+        cursor = Cursor(self, impl, timeout, False, isolation_level)
         return cursor
 
     async def _cursor_impl(

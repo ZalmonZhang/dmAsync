@@ -2,7 +2,7 @@
 
 > **非官方仓库。** `dmAsync` 由达梦以 PyPI 包 `dmasync` 的形式分发，**没有公开源码仓库**。
 > 本仓库是 `dmasync 1.0.0`（`dmAsync/`，纯 Python，约 12KB）在真实 DM8 上排查出若干
-> 缺陷后形成的**补丁快照（1.0.0.post1）**，用于自带与向上游反馈，不代表官方。
+> 缺陷后形成的**补丁快照（1.0.0.post2）**，用于自带与向上游反馈，不代表官方。
 > 官方分发：<https://pypi.org/project/dmasync/>
 
 ## 这是什么
@@ -12,19 +12,23 @@
 
 由于上游无源码仓库，本仓库直接保存补丁后的完整包源码，便于：
 
-1. **直接使用**：`pip install .` 得到修好的 `dmAsync 1.0.0.post1`（等价于产物 wheel）。
+1. **直接使用**：`pip install .` 得到修好的 `dmAsync 1.0.0.post2`（等价于产物 wheel）。
 2. **向上游反馈**：`patches/` 提供可 `git apply` 的补丁，`docs/` 提供逐条实测证据。
 3. **回归**：`tests/` 提供不依赖真实数据库的默认值断言。
 
-## 修复内容（1.0.0 → 1.0.0.post1）
+## 修复内容（1.0.0 → 1.0.0.post2）
 
 | # | 问题 | 位置 | 改动 |
 |---|---|---|---|
 | 1 | **建连间歇性 `-70019 网络通讯失败`**：`login_timeout` 默认 5s 对本环境 DM 登录握手偏紧（主因，并发只是放大器；纯裸 `dmPython` 串行也复现） | `dmAsync/connection.py` `connect()` 与 `Connection.__init__` | 默认 **5 → 30** |
 | 2 | **漏声明依赖**：`dmAsync/pool.py` `import async_timeout`，但包元数据只声明 `dmPython`，新环境 `import dmAsync` 即 `ModuleNotFoundError` | 包元数据 | 补 `Requires-Dist: async_timeout` |
 | 3 | **重复创建 future**：`Connection.__init__` 连续两次 `self._waiter = ...create_future()`（前者被覆盖、泄漏） | `dmAsync/connection.py` | 删除重复的一次 |
+| 4 | **`Connection._cursor` 位置参数错位**：`Cursor(conn, impl, timeout, echo, isolation_level=None)` 的第 4 位是 `echo`，却传了 `isolation_level`，导致**隔离级别被丢弃并污染 `echo`**（`post2`） | `dmAsync/connection.py` | 显式传 `echo=False`，`isolation_level` 归位 |
 
-补丁见 [`patches/0001-default-login-timeout-30-and-dedup-waiter.patch`](patches/0001-default-login-timeout-30-and-dedup-waiter.patch)。
+补丁按序 `git apply` 即可：修复 1~3 见
+[`patches/0001-default-login-timeout-30-and-dedup-waiter.patch`](patches/0001-default-login-timeout-30-and-dedup-waiter.patch)，
+修复 4 见
+[`patches/0002-cursor-echo-isolation-level-positional-fix.patch`](patches/0002-cursor-echo-isolation-level-positional-fix.patch)。
 
 ### 实测（真实 DM8 容器，每项 60 次全新物理连接）
 
@@ -50,7 +54,7 @@ pip install .
 也可自行构建 wheel：
 
 ```bash
-python -m build          # 产物：dist/dmAsync-1.0.0.post1-py3-none-any.whl
+python -m build          # 产物：dist/dmAsync-1.0.0.post2-py3-none-any.whl
 ```
 
 依赖：`dmPython`、`async_timeout`，Python ≥ 3.8。
@@ -77,15 +81,15 @@ conn = dmAsync.connect(user="SYSDBA", password="******",
 ## 已知限制（本快照未修）
 
 `dmAsync` 仍存在若干设计层面的问题（`fetchone/fetchall` 绕过 `to_thread`、服务端游标死代码、
-`Connection._cursor()` 位置参数错位、`dsn` 被丢弃等），详见审计文档。它们改动侵入性大，
+`dsn` 被丢弃、`AsyncConnection._connect` 参数元数等），详见审计文档。它们改动侵入性大，
 未纳入本补丁。
 
 ## 与 dmSQLAlchemy 的关系（重要）
 
-本仓库**只修 `dmAsync` 自身**（`login_timeout` 默认值、`async_timeout` 依赖声明、重复 future），
-**不包含任何 dmSQLAlchemy 方言侧的修复**。若你在使用 `dm+dmAsync://` 时遇到下表现象，
-需要的是 dmSQLAlchemy 的补丁（见 [`docs/dmAsync-坑点审计.md`](docs/dmAsync-坑点审计.md) §7、§8），
-**升级 `dmAsync` 本身不会解决**：
+本仓库**只修 `dmAsync` 自身**（`login_timeout` 默认值、`async_timeout` 依赖声明、重复 future、
+`Connection._cursor` 参数错位），**不包含任何 dmSQLAlchemy 方言侧的修复**。若你在使用
+`dm+dmAsync://` 时遇到下表现象，需要的是 dmSQLAlchemy 的补丁（见
+[`docs/dmAsync-坑点审计.md`](docs/dmAsync-坑点审计.md) §7、§8），**升级 `dmAsync` 本身不会解决**：
 
 | 现象 | 归属 | dmSQLAlchemy 侧修复 |
 |---|---|---|
@@ -94,6 +98,7 @@ conn = dmAsync.connect(user="SYSDBA", password="******",
 | `text()` + `executemany` 批量报 `'TextClause' object has no attribute 'table'` | 方言 | executemany 守卫（post2） |
 | 原生 `JSON` 列读回是 `str` 而非 `dict` | 方言 | `json_proc_decorator` 补 `json.loads`（post2） |
 | ORM `session.add_all([...])` 同步 `FlushError` / 异步 `TypeError` | 方言 | `insert_executemany_returning=False` + 清理死分支（post3/post4） |
+| 异步 `conn.stream()` / `stream_results` 报 `AssertionError` 或静默退化 | 方言 | 修服务端游标 `create_*_cursor`、删除覆盖的 `create_cursor`（post5） |
 
 ## 许可证
 
