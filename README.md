@@ -99,6 +99,7 @@ conn = dmAsync.connect(user="SYSDBA", password="******",
 | 原生 `JSON` 列读回是 `str` 而非 `dict` | 方言 | `json_proc_decorator` 补 `json.loads`（post2） |
 | ORM `session.add_all([...])` 同步 `FlushError` / 异步 `TypeError` | 方言 | `insert_executemany_returning=False` + 清理死分支（post3/post4） |
 | 异步 `conn.stream()` / `stream_results` 报 `AssertionError` 或静默退化 | 方言 | 修服务端游标 `create_*_cursor`、删除覆盖的 `create_cursor`（post5） |
+| 直接 `connect_async(dsn=...)` 无效 / URL query 参数较多时报 `TypeError` / dsn-only 报 `KeyError` | 方言 | `AsyncConnection._connect` 健壮性：`Connection()` 无参构造、`dsn` 条件化保留、`connection_timeout` 容错（post6） |
 
 ## 许可证
 

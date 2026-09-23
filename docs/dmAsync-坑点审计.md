@@ -152,8 +152,8 @@ SQLAlchemy 升级改变 `AsyncAdapt_dbapi_cursor.execute` 的消费方式时会�
 ## 7. 本地源包补丁清单（post 版 wheel）
 
 构建方式：`uvx --from wheel wheel unpack` → 改源码 → `wheel pack`，并清理 `INSTALLER/REQUESTED/direct_url.json` 等安装残留。
-产物（叠加使用，最新 **`dmSQLAlchemy post5` + `dmasync post2`**）：`dmasync-1.0.0.post1/2-py3-none-any.whl`、
-`dmSQLAlchemy-2.0.17.post1/2/3/4/5-py3-none-any.whl`。
+产物（叠加使用，最新 **`dmSQLAlchemy post6` + `dmasync post2`**）：`dmasync-1.0.0.post1/2-py3-none-any.whl`、
+`dmSQLAlchemy-2.0.17.post1/2/3/4/5/6-py3-none-any.whl`。
 
 ### 7.1 `dmAsync` 1.0.0 → 1.0.0.post1
 | 坑 | 文件 | 改动 |
@@ -214,7 +214,15 @@ post4 后 `Core return_defaults()+executemany` 变为诚实的 `[(None,), ...]`�
 - **M5 `fetchone/fetchall` 走同步 raw**（`AsyncAdapt_dmasync_cursor`）：会在事件循环里同步取数（20 万行实测阻塞 ≈0.24s）。
   主流做法是在 `_execute_async` 里缓冲 `_rows`（实测可降到 ≈0.067s），但需全量缓冲、并适配 `do_execute` 的外层 `await_only` 契约，改动侵入性大；
   **且 M4 修好后 `conn.stream()` 已能缓解大结果集阻塞（≈0.02s），暂不做**。
-- **低危 #1/#2**（`_connect` 的 dict 位置参数、`dsn` 被丢弃）：实际使用中无害（SQLAlchemy 路径靠 host/port 连接），未动。
+
+### 7.8 `dmSQLAlchemy` 2.0.17.post5 → 2.0.17.post6（低危 #1/#2：异步 `_connect` 健壮性）
+| 项 | 文件 | 改动 |
+|---|---|---|
+| #1 dict 位置参数 | `dmSQLAlchemy/dmasync.py`（`AsyncConnection._connect`） | `Connection(*kwargs)` → `Connection()`；删除同样错误的 `params` 死分支（`ConnectParams` 无 `_impl_class`、无法实例化） |
+| #2 dsn 丢弃 | 同上 + `AsyncConnection.__init__` | 保存 `self._dsn`；`_connect` 中**条件化**：`host` 存在则丢弃 dsn（否则 dmAsync 报 `ValueError`），`host` 缺失且 `dsn` 存在时才回退用 dsn |
+| 附带 | 同上（`Connection._connect`） | `cargs['connection_timeout']` 硬取键 → `cargs.get('connection_timeout') or 0`（dsn-only 路径原会 `KeyError`） |
+
+**根因**：`create_connect_args` 同时给出 `host` 与伪 `dsn='host:port'`，而 dmAsync 规定二者互斥，故 dsn 只能"有条件地"使用。实测见 §8.3。
 
 ## 8. 与主流方言对照 + 达梦 RETURNING 能力边界
 
@@ -290,3 +298,20 @@ C2/D4 的根因是"**架构选型像 Oracle、驱动能力却缺失**"。把 SQL
 且方言本身已把 `String(10)` 渲染为 `VARCHAR2(10 CHAR)`（`_supports_char_length=True`），列 `char_length=10`，
 所以"列语义"这一侧其实已按字符；**真正的坑在绑定侧**。
 因此**无法在 wheel 内修复**，只能：按字节预留列长（CJK ×3）、或建库时 `LENGTH_IN_CHAR=1`（当前实例只读，不可在线改）。
+
+### 8.3 异步 `_connect` 健壮性（低危 #1/#2）实测（`dmSQLAlchemy 2.0.17.post6`）
+
+| 场景 | 结果 |
+|---|---|
+| 正常异步 URL 连接 + `SELECT 1`（`host` 与伪 `dsn` 并存） | ✅ 不报 `ValueError` |
+| 含 **20 个连接 kwargs** 的 URL | ✅ 可连接 |
+| 旧形态 `Connection(*kwargs)`（≥19 key） | ❌ `TypeError: takes from 1 to 19 positional arguments but 21 were given`（证明旧调用形态非法） |
+| `connect_async(dsn="localhost:5236")`（正确端口） | ✅ 成功 |
+| `connect_async(dsn="localhost:5999")`（错误端口） | ✅ 按预期失败 `-70028 创建SOCKET连接失败`（证明 dsn 真被使用，而非丢弃退回默认 5236） |
+
+回归：`verify.py` PASS 21/23 KNOWN 0；`optionA_compare.py` TOTAL=21 FAIL=1(S10)；`--stress 30` 30/30。
+
+**附带发现**（经 dialect 透传到 `dmPython.connect` 的 URL query 参数合法性实测）：
+安全集 = `login_timeout / txn_isolation / use_stmt_pool / mpp_login / rwseparate / rwseparate_percent / lang_id / access_mode / ssl_path / schema / database / parse_type / ssl_pwd / ukey_name / ukey_pin / dmsvc_path / shake_crypto`；
+`compress_msg`（`-70067 压缩库未装载`）、`local_code`（`-70023 无效的参数值`）、`cursorclass`、`add_quote_all`、`_timeout` 会失败。
+（`database` 会被 dialect 提前转成 `schema`。）
