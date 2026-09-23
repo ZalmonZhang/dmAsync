@@ -80,6 +80,21 @@ conn = dmAsync.connect(user="SYSDBA", password="******",
 `Connection._cursor()` 位置参数错位、`dsn` 被丢弃等），详见审计文档。它们改动侵入性大，
 未纳入本补丁。
 
+## 与 dmSQLAlchemy 的关系（重要）
+
+本仓库**只修 `dmAsync` 自身**（`login_timeout` 默认值、`async_timeout` 依赖声明、重复 future），
+**不包含任何 dmSQLAlchemy 方言侧的修复**。若你在使用 `dm+dmAsync://` 时遇到下表现象，
+需要的是 dmSQLAlchemy 的补丁（见 [`docs/dmAsync-坑点审计.md`](docs/dmAsync-坑点审计.md) §7、§8），
+**升级 `dmAsync` 本身不会解决**：
+
+| 现象 | 归属 | dmSQLAlchemy 侧修复 |
+|---|---|---|
+| 异步建连即报 `attribute ... is read-only` | 方言 | 删除 `AsyncAdapt_*` 对基类 `__slots__` 的遮蔽声明（post1） |
+| 方言 `arraysize` 被吞 / `encoding_errors` 污染 / `connection_timeout` 报 `TypeError` | 方言 | `DMDialect_dmAsync.__init__` 改关键字传参（post2） |
+| `text()` + `executemany` 批量报 `'TextClause' object has no attribute 'table'` | 方言 | executemany 守卫（post2） |
+| 原生 `JSON` 列读回是 `str` 而非 `dict` | 方言 | `json_proc_decorator` 补 `json.loads`（post2） |
+| ORM `session.add_all([...])` 同步 `FlushError` / 异步 `TypeError` | 方言 | `insert_executemany_returning=False` + 清理死分支（post3/post4） |
+
 ## 许可证
 
 沿用上游 `dmAsync` 的 **Mulan PSL v2**（见 [`LICENSE`](LICENSE)）。本仓库仅为补丁再分发。
