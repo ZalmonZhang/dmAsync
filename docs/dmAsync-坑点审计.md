@@ -152,7 +152,8 @@ SQLAlchemy 升级改变 `AsyncAdapt_dbapi_cursor.execute` 的消费方式时会�
 ## 7. 本地源包补丁清单（post 版 wheel）
 
 构建方式：`uvx --from wheel wheel unpack` → 改源码 → `wheel pack`，并清理 `INSTALLER/REQUESTED/direct_url.json` 等安装残留。
-产物：`dmasync-1.0.0.post1-py3-none-any.whl`、`dmSQLAlchemy-2.0.17.post2-py3-none-any.whl`。
+产物（叠加使用，最新 `post4`）：`dmasync-1.0.0.post1-py3-none-any.whl`、
+`dmSQLAlchemy-2.0.17.post1/2/3/4-py3-none-any.whl`。
 
 ### 7.1 `dmAsync` 1.0.0 → 1.0.0.post1
 | 坑 | 文件 | 改动 |
@@ -171,8 +172,72 @@ SQLAlchemy 升级改变 `AsyncAdapt_dbapi_cursor.execute` 的消费方式时会�
 **post 版真实库实测**：H1/H2 sync+async 的 text INSERT/UPDATE/DELETE executemany 全通；M1 `arraysize=100 → 100`、M2 不再污染 `connection_timeout`、M3 不再 `TypeError`；原生 JSON 读回 `dict`；默认 `login_timeout=30`，全新异步引擎 30/30。
 `verify.py` 从 PASS 19/23 提升到 **PASS 21/23**（仅剩 C2/D4）。
 
-### 7.3 未纳入补丁（需评估，暂不改）
-- **C2/D4 ORM 单次 flush 多行 `add_all`**：卡在 RETURNING 批量回填（`insertmanyvalues` / `out_parameters` 路径），改动面大、风险高；继续用"逐条 add/commit"或 Core executemany。
+### 7.3 `dmSQLAlchemy` 2.0.17.post2 → 2.0.17.post3（坑 7：不再谎报批量 RETURNING）
+| 坑 | 文件 | 改动 |
+|---|---|---|
+| C2/D4（本审计外） | `dmSQLAlchemy/base.py`（`DMDialect`）、`dmSQLAlchemy/dmpython.py`（`DMDialect_dmPython`） | `insert_executemany_returning` 与 `insert_executemany_returning_sort_by_parameter_order` 由硬编码 `True` 改为 **`False`** |
+
+**根因**：DM 方言照抄了 Oracle `cx_oracle` 的能力声明（`use_insertmanyvalues=False` +
+`insert_executemany_returning=True`），但达梦驱动并不具备 Oracle 的数组 DML RETURNING 能力（实测见 §8）。
+谎报导致 ORM 多行 flush 走 executemany+RETURNING，却只回 1 行 PK。
+置 False 后属性退化为 `insert_returning and use_insertmanyvalues == False`，
+SQLAlchemy 自动改为**逐行 INSERT + 单行 RETURNING INTO**。
+
+### 7.4 `dmSQLAlchemy` 2.0.17.post3 → 2.0.17.post4（坑 7 残留清理）
+| 坑 | 文件 | 改动 |
+|---|---|---|
+| C2/D4 残留 | `dmSQLAlchemy/extensions.py` | `DMDialect_Adapter.do_executemany_return` / `async_do_executemany_return`：**无 out 参数时一律 plain `executemany`**，删除已死的手工 `RETURNING ... INTO ?` else 分支 |
+
+旧实现在此对**每次** Core executemany 都追加 `RETURNING ... INTO ?` 并合成 `inserted_primary_key_rows=[(1,)]`（行数/值都错，静默）。
+post4 后 `Core return_defaults()+executemany` 变为诚实的 `[(None,), ...]`，且少拼一次 RETURNING
+（Core executemany 1000 行 0.020s→0.019s）。
+
+### 7.5 未纳入补丁（需评估，暂不改）
 - **M4 服务端游标**：`create_cursor` 覆盖可修，但 `AsyncConnection.stream()` 依赖 `_is_server_side`，需整体验证，未改。
 - **M5 `fetchone/fetchall` 走同步 raw**：属 AsyncAdapt 层设计，改动侵入性大。
 - **低危若干**（`_connect` 的 dict 位置参数、`dsn` 被丢弃、`Cursor(...)` 位置错位）：未动。
+
+## 8. 与主流方言对照 + 达梦 RETURNING 能力边界
+
+C2/D4 的根因是"**架构选型像 Oracle、驱动能力却缺失**"。把 SQLAlchemy 主流方言的批量插入路线摊开：
+
+| 方言 | `use_insertmanyvalues` | `insert_returning` | `insert_executemany_returning` | `postfetch_lastrowid` | 批量机制 | RETURNING 取回 |
+|---|---|---|---|---|---|---|
+| PostgreSQL | ✅ True | True | True（属性） | False | 原生多 VALUES | 结果集 `RETURNING col` |
+| MSSQL | ✅ True | True | True（属性） | True | 原生多 VALUES | 结果集 `OUTPUT` |
+| MySQL | ✅ True | **False** | **False**（属性） | True | 多 VALUES + sentinel | 无（靠 `lastrowid`） |
+| **Oracle** | ❌ False | True | **True（硬编码）** | False | DBAPI 数组 DML（arrayvar） | `RETURNING ... INTO :arrayvar` |
+| **达梦 DM** | ❌ False | True | **True（硬编码，谎报）** | **True** | 照抄 Oracle 数组 var（驱动不支持） | `RETURNING ... INTO`（仅单行可用） |
+
+**达梦方言与 Oracle 逐点同构**：`returning_clause` 生成 `RETURNING ... INTO :ret_N`、
+`_generate_out_parameter_vars` 用 `cursor.var(dbtype, arraysize=len_params)`、
+`post_exec` 用 `FullyBufferedCursorFetchStrategy` 装配 —— 与 `cx_oracle.py` 几乎逐行一致，且内置 `OracleCompatible_Mode`。
+差别在于 Oracle 的 **cx_Oracle 数组 DML 真能回填 N 行**，而达梦驱动不能。
+
+**达梦驱动能力实测（裸 dmPython / DM8）**：
+
+| 能力 | 结果 |
+|---|---|
+| 单行 `INSERT ... RETURNING id INTO :ret` | ✅ `1.0` |
+| executemany + 数组 out var | ❌ `dmVar_SetSingleValue: array size exceeded` |
+| 多 VALUES + 结果集式 `RETURNING id` | ❌ `-2007 语法分析出错` |
+| 单 VALUES + 结果集式 `RETURNING id` | ❌ `-2007 语法分析出错` |
+| 普通 executemany（无 RETURNING） | ✅ `rowcount=N`，返回 `None` |
+| `cursor.lastrowid` | ⚠️ 返回 **ROWID 字符串**（非自增整数） |
+| 数组 var + `setinputsizes` / `bindarraysize` | 💥 **解释器访问冲突崩溃（0xC0000005）** |
+
+**结论**：现有驱动下达梦只能"**单行 + RETURNING INTO**"。因此正确的主流对齐做法是
+**诚实降级**（学 MySQL：不声明 `insert_executemany_returning`），让 SQLAlchemy 走逐行 INSERT；
+而非强行模拟 IMV（需结果集式 RETURNING，不支持）或 Oracle 数组 DML（不支持且会崩）。
+
+**C2/D4 修复前后对照**（`optionA_compare.py`，21 用例；建议入库作回归）：
+
+| 用例 | post2（baseline） | post4 |
+|---|---|---|
+| ORM `add_all`（同步 / 异步） | ❌ FlushError / TypeError | ✅ PK 正确回填、对象↔行映射一致 |
+| Core `return_defaults`+executemany | ⚠️ 静默 `[(1,)]` | ⚠️ 诚实 `[(None,), ...]`（数量正确） |
+| 显式 `returning`+executemany | ⚠️ 静默 `[(1,)]` | ✅ 明确报错（快速失败） |
+| Core executemany（批量） | ✅ 1 语句 | ✅ 1 语句（性能不变） |
+| 单条 insert / text executemany / DML / 类型往返 | ✅ | ✅ |
+
+`verify.py`：**PASS 19/23 → 21/23**，KNOWN **4 → 0**。
